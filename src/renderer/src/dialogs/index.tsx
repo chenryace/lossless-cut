@@ -14,6 +14,7 @@ import CopyClipboardButton from '../components/CopyClipboardButton';
 import Checkbox from '../components/Checkbox';
 import { isWindows, showItemInFolder } from '../util';
 import { ParseTimecode, SegmentBase } from '../types';
+import { FindKeyframeMode } from '../ffmpeg';
 
 const remote = window.require('@electron/remote');
 const { dialog, shell } = remote;
@@ -168,6 +169,13 @@ export async function showMuxNotSupported() {
   });
 }
 
+export async function showOutputNotWritable() {
+  await Swal.fire({
+    icon: 'error',
+    text: i18n.t('You are not allowed to write the output file. This probably means that the file already exists with the wrong permissions, or you don\'t have write permissions to the output folder.'),
+  });
+}
+
 export async function showRefuseToOverwrite() {
   await Swal.fire({
     icon: 'warning',
@@ -284,8 +292,8 @@ async function askForSegmentsRandomDurationRange() {
   return parse(value);
 }
 
-async function askForSegmentsStartOrEnd(text) {
-  const { value } = await Swal.fire({
+async function askForSegmentsStartOrEnd(text: string) {
+  const { value } = await Swal.fire<string>({
     input: 'radio',
     showCancelButton: true,
     inputOptions: {
@@ -316,7 +324,7 @@ export async function askForShiftSegments({ inputPlaceholder, parseTimecode }: {
     return undefined;
   }
 
-  const { value } = await Swal.fire({
+  const { value } = await Swal.fire<string>({
     input: 'text',
     showCancelButton: true,
     inputValue: inputPlaceholder,
@@ -345,14 +353,14 @@ export async function askForAlignSegments() {
   const startOrEnd = await askForSegmentsStartOrEnd(i18n.t('Do you want to align the segment start or end timestamps to keyframes?'));
   if (startOrEnd == null) return undefined;
 
-  const { value: mode } = await Swal.fire({
+  const { value: mode } = await Swal.fire<FindKeyframeMode>({
     input: 'radio',
     showCancelButton: true,
     inputOptions: {
       nearest: i18n.t('Nearest keyframe'),
       before: i18n.t('Previous keyframe'),
       after: i18n.t('Next keyframe'),
-    },
+    } satisfies Record<FindKeyframeMode, unknown>,
     inputValue: 'before',
     text: i18n.t('Do you want to align segment times to the nearest, previous or next keyframe?'),
   });
@@ -386,13 +394,25 @@ export async function confirmExtractAllStreamsDialog() {
   return !!value;
 }
 
-const CleanupChoices = ({ cleanupChoicesInitial, onChange: onChangeProp }) => {
+export interface CleanupChoicesType {
+  trashTmpFiles: boolean,
+  closeFile: boolean,
+  askForCleanup: boolean,
+  cleanupAfterExport?: boolean | undefined,
+  trashSourceFile?: boolean,
+  trashProjectFile?: boolean,
+  deleteIfTrashFails?: boolean,
+}
+export type CleanupChoice = keyof CleanupChoicesType;
+
+
+const CleanupChoices = ({ cleanupChoicesInitial, onChange: onChangeProp }: { cleanupChoicesInitial: CleanupChoicesType, onChange: (v: CleanupChoicesType) => void }) => {
   const [choices, setChoices] = useState(cleanupChoicesInitial);
 
-  const getVal = (key) => !!choices[key];
+  const getVal = (key: CleanupChoice) => !!choices[key];
 
-  const onChange = (key, val) => setChoices((oldChoices) => {
-    const newChoices = { ...oldChoices, [key]: val };
+  const onChange = (key: CleanupChoice, val: boolean | string) => setChoices((oldChoices) => {
+    const newChoices = { ...oldChoices, [key]: Boolean(val) };
     if ((newChoices.trashSourceFile || newChoices.trashTmpFiles) && !newChoices.closeFile) {
       newChoices.closeFile = true;
     }
@@ -429,10 +449,10 @@ const CleanupChoices = ({ cleanupChoicesInitial, onChange: onChangeProp }) => {
   );
 };
 
-export async function showCleanupFilesDialog(cleanupChoicesIn) {
+export async function showCleanupFilesDialog(cleanupChoicesIn: CleanupChoicesType) {
   let cleanupChoices = cleanupChoicesIn;
 
-  const { value } = await ReactSwal.fire({
+  const { value } = await ReactSwal.fire<string>({
     title: i18n.t('Cleanup files?'),
     html: <CleanupChoices cleanupChoicesInitial={cleanupChoices} onChange={(newChoices) => { cleanupChoices = newChoices; }} />,
     confirmButtonText: i18n.t('Confirm'),
@@ -524,8 +544,8 @@ export async function showConcatFailedDialog({ fileFormat }: { fileFormat: strin
   return value;
 }
 
-export function openYouTubeChaptersDialog(text: string) {
-  ReactSwal.fire({
+export async function openYouTubeChaptersDialog(text: string) {
+  await ReactSwal.fire({
     showCloseButton: true,
     title: i18n.t('YouTube Chapters'),
     html: (
@@ -565,7 +585,7 @@ export async function selectSegmentsByLabelDialog(currentName: string) {
 export async function selectSegmentsByExprDialog(inputValidator: (v: string) => Promise<string | undefined>) {
   const examples = {
     duration: { name: i18n.t('Segment duration less than 5 seconds'), code: 'segment.duration < 5' },
-    start: { name: i18n.t('Segment starts after 00:60'), code: 'segment.start > 60' },
+    start: { name: i18n.t('Segment starts after 01:00'), code: 'segment.start > 60' },
     label: { name: i18n.t('Segment label (exact)'), code: "segment.label === 'My label'" },
     regexp: { name: i18n.t('Segment label (regexp)'), code: '/^My label/.test(segment.label)' },
     tag: { name: i18n.t('Segment tag value'), code: "segment.tags.myTag === 'tag value'" },

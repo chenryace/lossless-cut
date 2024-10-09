@@ -193,10 +193,10 @@ function BottomBar({
   darkMode, setDarkMode,
   toggleShowThumbnails, toggleWaveformMode, waveformMode, showThumbnails,
   outputPlaybackRate, setOutputPlaybackRate,
-  formatTimecode, parseTimecode,
+  formatTimecode, parseTimecode, playbackRate,
 }: {
   zoom: number,
-  setZoom: Dispatch<SetStateAction<number>>,
+  setZoom: (fn: (z: number) => number) => void,
   timelineToggleComfortZoom: () => void,
   isRotationSet: boolean,
   rotation: number,
@@ -242,6 +242,7 @@ function BottomBar({
   setOutputPlaybackRate: (v: number) => void,
   formatTimecode: FormatTimecode,
   parseTimecode: ParseTimecode,
+  playbackRate: number,
 }) {
   const { t } = useTranslation();
   const { getSegColor } = useSegColors();
@@ -456,7 +457,7 @@ function BottomBar({
 
             <div role="button" style={{ marginRight: 5, marginLeft: 10 }} title={t('Zoom')} onClick={timelineToggleComfortZoom}>{Math.floor(zoom)}x</div>
 
-            <Select style={{ height: 20, flexBasis: 85, flexGrow: 0 }} value={zoomOptions.includes(zoom) ? zoom.toString() : ''} title={t('Zoom')} onChange={withBlur((e) => setZoom(parseInt(e.target.value, 10)))}>
+            <Select style={{ height: 20, flexBasis: 85, flexGrow: 0 }} value={zoomOptions.includes(zoom) ? zoom.toString() : ''} title={t('Zoom')} onChange={withBlur((e) => setZoom(() => parseInt(e.target.value, 10)))}>
               <option key="" value="" disabled>{t('Zoom')}</option>
               {zoomOptions.map((val) => (
                 <option key={val} value={String(val)}>{t('Zoom')} {val}x</option>
@@ -468,6 +469,8 @@ function BottomBar({
             )}
 
             <IoMdSpeedometer title={t('Change FPS')} style={{ padding: '0 .2em', fontSize: '1.3em' }} role="button" onClick={handleChangePlaybackRateClick} />
+
+            <div title={t('Playback rate')} style={{ color: 'var(--gray11)', fontSize: '.7em', marginLeft: '.1em' }}>{playbackRate.toFixed(1)}</div>
           </>
         )}
 

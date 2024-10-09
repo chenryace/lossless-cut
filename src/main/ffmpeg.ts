@@ -11,6 +11,7 @@ import { platform, arch, isWindows, isMac, isLinux } from './util.js';
 import { CaptureFormat, Html5ifyMode, Waveform } from '../../types.js';
 import isDev from './isDev.js';
 import logger from './logger.js';
+import { parseFfmpegProgressLine } from './progress.js';
 
 
 const runningFfmpegs = new Set<ExecaChildProcess<Buffer>>();
@@ -23,8 +24,16 @@ export function setCustomFfPath(path: string | undefined) {
   customFfPath = path;
 }
 
+function escapeCliArg(arg: string) {
+  if (isWindows) {
+    // https://github.com/mifi/lossless-cut/issues/2151
+    return /[\s"&<>^|]/.test(arg) ? `"${arg.replaceAll('"', '""')}"` : arg;
+  }
+  return /[^\w-]/.test(arg) ? `'${arg.replaceAll("'", '\'"\'"\'')}'` : arg;
+}
+
 export function getFfCommandLine(cmd: string, args: readonly string[]) {
-  return `${cmd} ${args.map((arg) => (/[^\w-]/.test(arg) ? `'${arg}'` : arg)).join(' ')}`;
+  return `${cmd} ${args.map((arg) => escapeCliArg(arg)).join(' ')}`;
 }
 
 function getFfPath(cmd: string) {
@@ -53,7 +62,12 @@ export function abortFfmpegs() {
   });
 }
 
-function handleProgress(process: { stderr: Readable | null }, durationIn: number | undefined, onProgress: (a: number) => void, customMatcher: (a: string) => void = () => undefined) {
+function handleProgress(
+  process: { stderr: Readable | null },
+  duration: number | undefined,
+  onProgress: (a: number) => void,
+  customMatcher?: (a: string) => void,
+) {
   if (!onProgress) return;
   if (process.stderr == null) return;
   onProgress(0);
@@ -63,47 +77,12 @@ function handleProgress(process: { stderr: Readable | null }, durationIn: number
     // console.log('progress', line);
 
     try {
-      // eslint-disable-next-line unicorn/better-regex
-      let match = line.match(/frame=\s*[^\s]+\s+fps=\s*[^\s]+\s+q=\s*[^\s]+\s+(?:size|Lsize)=\s*[^\s]+\s+time=\s*([^\s]+)\s+/);
-      // Audio only looks like this: "line size=  233422kB time=01:45:50.68 bitrate= 301.1kbits/s speed= 353x    "
-      // eslint-disable-next-line unicorn/better-regex
-      if (!match) match = line.match(/(?:size|Lsize)=\s*[^\s]+\s+time=\s*([^\s]+)\s+/);
-      if (!match) {
-        customMatcher(line);
-        return;
+      const progress = parseFfmpegProgressLine({ line, customMatcher, duration });
+      if (progress != null) {
+        onProgress(progress);
       }
-
-      const timeStr = match[1];
-      // console.log(timeStr);
-      const match2 = timeStr!.match(/^(-?)(\d+):(\d+):(\d+)\.(\d+)$/);
-      if (!match2) throw new Error(`Invalid time from ffmpeg progress ${timeStr}`);
-
-      const sign = match2[1];
-
-      if (sign === '-') {
-        // For some reason, ffmpeg sometimes gives a negative progress, e.g. "-00:00:06.46"
-        // let's just ignore that
-        return;
-      }
-
-      const h = parseInt(match2[2]!, 10);
-      const m = parseInt(match2[3]!, 10);
-      const s = parseInt(match2[4]!, 10);
-      const cs = parseInt(match2[5]!, 10);
-      const time = (((h * 60) + m) * 60 + s) + cs / 100;
-      // console.log(time);
-
-      const progressTime = Math.max(0, time);
-      // console.log(progressTime);
-
-      if (durationIn == null) return;
-      const duration = Math.max(0, durationIn);
-      if (duration === 0) return;
-      const progress = duration ? Math.min(progressTime / duration, 1) : 0; // sometimes progressTime will be greater than cutDuration
-      onProgress(progress);
     } catch (err) {
-      // @ts-expect-error todo
-      logger.error('Failed to parse ffmpeg progress line:', err.message);
+      logger.error('Failed to parse ffmpeg progress line:', err instanceof Error ? err.message : err);
     }
   });
 }
@@ -154,7 +133,9 @@ export async function runFfmpegConcat({ ffmpegArgs, concatTxt, totalDuration, on
 }
 
 export async function runFfmpegWithProgress({ ffmpegArgs, duration, onProgress }: {
-  ffmpegArgs: string[], duration: number | undefined, onProgress: (a: number) => void,
+  ffmpegArgs: string[],
+  duration?: number | undefined,
+  onProgress: (a: number) => void,
 }) {
   const process = runFfmpegProcess(ffmpegArgs);
   assert(process.stderr != null);
@@ -243,12 +224,18 @@ const getInputSeekArgs = ({ filePath, from, to }: { filePath: string, from?: num
   ...(from != null && to != null ? ['-t', (to - from).toFixed(5)] : []),
 ];
 
-export function mapTimesToSegments(times: number[]) {
+export function mapTimesToSegments(times: number[], includeLast: boolean) {
   const segments: { start: number, end: number | undefined }[] = [];
   for (let i = 0; i < times.length; i += 1) {
     const start = times[i];
     const end = times[i + 1];
-    if (start != null) segments.push({ start, end }); // end undefined is allowed (means until end of video)
+    if (start != null) {
+      if (end != null) {
+        segments.push({ start, end });
+      } else if (includeLast) {
+        segments.push({ start, end }); // end undefined is allowed (means until end of video)
+      }
+    }
   }
   return segments;
 }
@@ -289,13 +276,13 @@ export async function detectSceneChanges({ filePath, minChange, onProgress, from
 
   await process;
 
-  const segments = mapTimesToSegments(times);
+  const segments = mapTimesToSegments(times, false);
 
   return adjustSegmentsWithOffset({ segments, from });
 }
 
-async function detectIntervals({ filePath, customArgs, onProgress, from, to, matchLineTokens }: {
-  filePath: string, customArgs: string[], onProgress: (p: number) => void, from: number, to: number, matchLineTokens: (line: string) => { start?: string | number | undefined, end?: string | number | undefined },
+async function detectIntervals({ filePath, customArgs, onProgress, from, to, matchLineTokens, boundingMode }: {
+  filePath: string, customArgs: string[], onProgress: (p: number) => void, from: number, to: number, matchLineTokens: (line: string) => { start: number, end: number } | undefined, boundingMode: boolean
 }) {
   const args = [
     '-hide_banner',
@@ -305,93 +292,96 @@ async function detectIntervals({ filePath, customArgs, onProgress, from, to, mat
   ];
   const process = runFfmpegProcess(args, { buffer: false });
 
-  const segments: { start: number, end: number }[] = [];
+  let segments: { start: number, end: number }[] = [];
+  const midpoints: number[] = [];
 
   function customMatcher(line: string) {
-    const { start: startRaw, end: endRaw } = matchLineTokens(line);
-    if (typeof startRaw === 'number' && typeof endRaw === 'number') {
-      if (startRaw == null || endRaw == null) return;
-      if (Number.isNaN(startRaw) || Number.isNaN(endRaw)) return;
-      segments.push({ start: startRaw, end: endRaw });
-    } else if (typeof startRaw === 'string' && typeof endRaw === 'string') {
-      if (startRaw == null || endRaw == null) return;
-      const start = parseFloat(startRaw);
-      const end = parseFloat(endRaw);
-      if (Number.isNaN(start) || Number.isNaN(end)) return;
+    const match = matchLineTokens(line);
+    if (match == null) return;
+    const { start, end } = match;
+
+    if (boundingMode) {
       segments.push({ start, end });
     } else {
-      throw new TypeError('Invalid line match');
+      midpoints.push(start + ((end - start) / 2));
     }
   }
   handleProgress(process, to - from, onProgress, customMatcher);
 
   await process;
+
+  if (!boundingMode) {
+    segments = midpoints.flatMap((time, i) => [
+      {
+        start: midpoints[i - 1] ?? 0,
+        end: time,
+      },
+      {
+        start: time,
+        end: midpoints[i + 1] ?? (to - from),
+      },
+    ]);
+  }
+
   return adjustSegmentsWithOffset({ segments, from });
 }
 
 const mapFilterOptions = (options: Record<string, string>) => Object.entries(options).map(([key, value]) => `${key}=${value}`).join(':');
 
-export async function blackDetect({ filePath, filterOptions, onProgress, from, to }: { filePath: string, filterOptions: Record<string, string>, onProgress: (p: number) => void, from: number, to: number }) {
-  const customArgs = ['-vf', `blackdetect=${mapFilterOptions(filterOptions)}`, '-an'];
-  return detectIntervals({
-    filePath,
-    onProgress,
-    from,
-    to,
-    matchLineTokens: (line) => {
-      // eslint-disable-next-line unicorn/better-regex
-      const match = line.match(/^[blackdetect\s*@\s*0x[0-9a-f]+] black_start:([\d\\.]+) black_end:([\d\\.]+) black_duration:[\d\\.]+/);
-      if (!match) {
-        return {
-          start: undefined,
-          end: undefined,
-        };
-      }
-      return {
-        start: match[1],
-        end: match[2],
-      };
-    },
-    customArgs,
-  });
-}
-
-export async function silenceDetect({ filePath, filterOptions, onProgress, from, to }: {
-  filePath: string, filterOptions: Record<string, string>, onProgress: (p: number) => void, from: number, to: number,
+export async function blackDetect({ filePath, filterOptions, boundingMode, onProgress, from, to }: {
+  filePath: string, filterOptions: Record<string, string>, boundingMode: boolean, onProgress: (p: number) => void, from: number, to: number,
 }) {
   return detectIntervals({
     filePath,
     onProgress,
     from,
     to,
+    boundingMode,
+    matchLineTokens: (line) => {
+      // eslint-disable-next-line unicorn/better-regex
+      const match = line.match(/^[blackdetect\s*@\s*0x[0-9a-f]+] black_start:([\d\\.]+) black_end:([\d\\.]+) black_duration:[\d\\.]+/);
+      if (!match) {
+        return undefined;
+      }
+      const start = parseFloat(match[1]!);
+      const end = parseFloat(match[2]!);
+      if (Number.isNaN(start) || Number.isNaN(end)) {
+        return undefined;
+      }
+      if (start < 0 || end <= 0 || start >= end) {
+        return undefined;
+      }
+      return { start, end };
+    },
+    customArgs: ['-vf', `blackdetect=${mapFilterOptions(filterOptions)}`, '-an'],
+  });
+}
+
+export async function silenceDetect({ filePath, filterOptions, boundingMode, onProgress, from, to }: {
+  filePath: string, filterOptions: Record<string, string>, boundingMode: boolean, onProgress: (p: number) => void, from: number, to: number,
+}) {
+  return detectIntervals({
+    filePath,
+    onProgress,
+    from,
+    to,
+    boundingMode,
     matchLineTokens: (line) => {
       // eslint-disable-next-line unicorn/better-regex
       const match = line.match(/^[silencedetect\s*@\s*0x[0-9a-f]+] silence_end: ([\d\\.]+)[|\s]+silence_duration: ([\d\\.]+)/);
       if (!match) {
-        return {
-          start: undefined,
-          end: undefined,
-        };
+        return undefined;
       }
       const end = parseFloat(match[1]!);
       const silenceDuration = parseFloat(match[2]!);
       if (Number.isNaN(end) || Number.isNaN(silenceDuration)) {
-        return {
-          start: undefined,
-          end: undefined,
-        };
+        return undefined;
       }
       const start = end - silenceDuration;
       if (start < 0 || end <= 0 || start >= end) {
-        return {
-          start: undefined,
-          end: undefined,
-        };
+        return undefined;
       }
-      return {
-        start,
-        end,
-      };
+      return { start, end };
     },
     customArgs: ['-af', `silencedetect=${mapFilterOptions(filterOptions)}`, '-vn'],
   });
@@ -416,7 +406,15 @@ function getCodecOpts(captureFormat: CaptureFormat) {
 }
 
 export async function captureFrames({ from, to, videoPath, outPathTemplate, quality, filter, framePts, onProgress, captureFormat }: {
-  from: number, to: number, videoPath: string, outPathTemplate: string, quality: number, filter?: string | undefined, framePts?: boolean | undefined, onProgress: (p: number) => void, captureFormat: CaptureFormat,
+  from: number,
+  to: number,
+  videoPath: string,
+  outPathTemplate: string,
+  quality: number,
+  filter?: string | undefined,
+  framePts?: boolean | undefined,
+  onProgress: (p: number) => void,
+  captureFormat: CaptureFormat,
 }) {
   const args = [
     '-ss', String(from),
